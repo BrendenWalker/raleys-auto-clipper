@@ -261,11 +261,29 @@ async function waitForLoginFormOrThrow(page, timeout = 180000) {
 }
 
 async function waitForManualLoginCompletion(page, timeoutMs = 300000) {
+    const initialCookies = await page.cookies().catch(() => [])
+    const initialAuthSignature = initialCookies
+        .filter((cookie) => /auth|token|sess|login/i.test(cookie?.name || ''))
+        .map((cookie) => `${cookie.name}=${cookie.value}`)
+        .sort()
+        .join('|')
+
     const start = Date.now()
     while (Date.now() - start < timeoutMs) {
         const cookies = await page.cookies().catch(() => [])
         const currentUrl = page.url()
-        const looksLoggedIn = validateCookieCollection(cookies) && !/\/login|\/sign-in/i.test(currentUrl)
+
+        const currentAuthSignature = cookies
+            .filter((cookie) => /auth|token|sess|login/i.test(cookie?.name || ''))
+            .map((cookie) => `${cookie.name}=${cookie.value}`)
+            .sort()
+            .join('|')
+
+        // Require an auth-cookie state change so stale cookies don't short-circuit manual CAPTCHA flow.
+        const authStateChanged = currentAuthSignature !== initialAuthSignature
+        const looksLoggedIn = validateCookieCollection(cookies) &&
+            authStateChanged &&
+            !/\/login|\/sign-in/i.test(currentUrl)
         if (looksLoggedIn) return cookies
         await sleep(1000)
     }
