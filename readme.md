@@ -4,7 +4,7 @@ Automates the process of logging into a Raley's online grocery account and clipp
 
 ## 🧩 Features
 
-- Headless login using Puppeteer with stealth plugin
+- Cookie-first auth for headless automation, with optional visible login assist
 - Retrieves and clips **Something Extra**, **Weekly Exclusive**, and **Digital Coupon** offers
 - Optional randomized delays for mimicry and anti-bot evasion
 - Supports CLI arguments and `.env` config
@@ -77,7 +77,7 @@ node index.js --help
 ## 🧪 Behavior
 
 - Logs into [raleys.com](https://raleys.com) using stealth Puppeteer.
-- Captures login cookies and uses them with Axios to call authenticated clipping endpoints.
+- Uses cookies for authenticated API clipping, and can refresh them via visible browser login when needed.
 - Randomized script start and request delays can help avoid detection.
 
 
