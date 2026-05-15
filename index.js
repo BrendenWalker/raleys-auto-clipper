@@ -240,12 +240,44 @@ async function waitForLoginForm(page, timeout = 15000) {
     }, { timeout })
 }
 
+function isNextAuthSessionCookieName(name) {
+    if (!name) return false
+    return (
+        /^__Secure-next-auth\.session-token$/i.test(name) ||
+        /^__Host-next-auth\.session-token$/i.test(name) ||
+        /^next-auth\.session-token$/i.test(name)
+    )
+}
+
+async function readNextAuthSessionPayload(page) {
+    return page.evaluate(async () => {
+        try {
+            const response = await fetch('/api/auth/session', {
+                credentials: 'include',
+                headers: { Accept: 'application/json' }
+            })
+            if (!response.ok) {
+                return { ok: false, status: response.status }
+            }
+            const data = await response.json()
+            return { ok: true, data }
+        } catch (error) {
+            return { ok: false, error: String(error?.message || error) }
+        }
+    })
+}
+
+function nextAuthSessionHasUser(payload) {
+    const user = payload?.data?.user
+    return Boolean(user && (user.email || user.name || user.id))
+}
+
 async function waitForValidCookies(page, timeoutMs = 120000) {
     const start = Date.now()
     while (Date.now() - start < timeoutMs) {
-        const cookies = await page.cookies()
-        if (validateCookieCollection(cookies)) {
-            return cookies
+        const payload = await readNextAuthSessionPayload(page)
+        if (payload?.ok && nextAuthSessionHasUser(payload)) {
+            return await page.cookies()
         }
         await sleep(1000)
     }
@@ -261,30 +293,17 @@ async function waitForLoginFormOrThrow(page, timeout = 180000) {
 }
 
 async function waitForManualLoginCompletion(page, timeoutMs = 300000) {
-    const initialCookies = await page.cookies().catch(() => [])
-    const initialAuthSignature = initialCookies
-        .filter((cookie) => /auth|token|sess|login/i.test(cookie?.name || ''))
-        .map((cookie) => `${cookie.name}=${cookie.value}`)
-        .sort()
-        .join('|')
-
     const start = Date.now()
     while (Date.now() - start < timeoutMs) {
-        const cookies = await page.cookies().catch(() => [])
         const currentUrl = page.url()
-
-        const currentAuthSignature = cookies
-            .filter((cookie) => /auth|token|sess|login/i.test(cookie?.name || ''))
-            .map((cookie) => `${cookie.name}=${cookie.value}`)
-            .sort()
-            .join('|')
-
-        // Require an auth-cookie state change so stale cookies don't short-circuit manual CAPTCHA flow.
-        const authStateChanged = currentAuthSignature !== initialAuthSignature
-        const looksLoggedIn = validateCookieCollection(cookies) &&
-            authStateChanged &&
-            !/\/login|\/sign-in/i.test(currentUrl)
-        if (looksLoggedIn) return cookies
+        if (/\/login|\/sign-in/i.test(currentUrl)) {
+            await sleep(1000)
+            continue
+        }
+        const payload = await readNextAuthSessionPayload(page)
+        if (payload?.ok && nextAuthSessionHasUser(payload)) {
+            return await page.cookies()
+        }
         await sleep(1000)
     }
     return null
@@ -338,7 +357,8 @@ function validateCookieCollection(cookies) {
         return true
     })
     if (sessionCandidates.length === 0) return false
-    return sessionCandidates.some((cookie) => /auth|token|sess|login/i.test(cookie.name))
+    // Offers API is gated on NextAuth; FLDR / analytics cookies (e.g. ai_session) are not sufficient.
+    return sessionCandidates.some((cookie) => isNextAuthSessionCookieName(cookie.name))
 }
 
 async function getLoginCookiesFromBrowser() {
@@ -397,11 +417,16 @@ async function getLoginCookiesFromBrowser() {
             await clickFirstSelector(page, ['#password', 'input[type="password"]', 'input[name="password"]', 'input[autocomplete="current-password"]'])
             await typeLikeHuman(page, '#password, input[type="password"], input[name="password"], input[autocomplete="current-password"]', config.password)
             await enableRememberMeIfPresent(page)
-            await appendLog('INFO', 'Please solve captcha, submit login, then navigate to home page while logged in.')
+            await appendLog(
+                'INFO',
+                'Please solve captcha, submit login, then stay on www.raleys.com until your account session is fully active (home or offers page while signed in).'
+            )
             const manualCookies = await waitForManualLoginCompletion(page, 300000)
             if (!manualCookies) {
                 await captureLoginDebugArtifacts(page, 'manual-login-timeout')
-                throw new Error('Timed out waiting for manual login completion. Please retry and ensure you navigate to home page while logged in.')
+                throw new Error(
+                    'Timed out waiting for a signed-in NextAuth session. After submitting login, stay on www.raleys.com until the site shows you as signed in (session may take a few seconds after FLDR cookies appear).'
+                )
             }
             await appendLog('INFO', 'Manual login completed; auth cookies captured.')
             return manualCookies
@@ -489,11 +514,18 @@ async function getLoginCookiesFromBrowser() {
             }
 
             const cookies = await page.cookies()
-            if (validateCookieCollection(cookies)) {
-                await appendLog('INFO', 'Login cookies captured from browser.')
+            const sessionPayload = await readNextAuthSessionPayload(page)
+            if (nextAuthSessionHasUser(sessionPayload)) {
+                await appendLog('INFO', 'NextAuth session detected after login submit.')
                 return cookies
             }
-            await appendLog('WARN', `Login submit attempt ${attempt} did not yield valid cookies.`)
+            if (validateCookieCollection(cookies)) {
+                await appendLog(
+                    'WARN',
+                    `Login submit attempt ${attempt} set cookies but NextAuth session is not ready yet; retrying or wait for manual flow.`
+                )
+            }
+            await appendLog('WARN', `Login submit attempt ${attempt} did not yield an authenticated NextAuth session.`)
         }
 
         await captureLoginDebugArtifacts(page, 'login-submit-failed')
@@ -526,10 +558,17 @@ function setCookiesToJar(jar, cookies, url) {
 function buildRalleysClient(cookies) {
     const jar = new CookieJar()
     setCookiesToJar(jar, cookies, 'https://www.raleys.com')
+    const browserLikeHeaders = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Accept: 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        Referer: 'https://www.raleys.com/'
+    }
     const client = wrapper(axios.create({
         baseURL: 'https://www.raleys.com',
         jar,
-        withCredentials: true
+        withCredentials: true,
+        headers: browserLikeHeaders
     }))
     return { client, jar }
 }
@@ -556,7 +595,9 @@ async function loadCookiesFromDisk() {
     const cookieFile = await fs.readFile(config.cookiesFile, 'utf-8')
     const parsed = JSON.parse(cookieFile)
     if (!validateCookieCollection(parsed)) {
-        throw new Error('Cookie file exists but does not contain valid, non-expired auth/session cookies.')
+        throw new Error(
+            'Cookie file exists but does not contain a valid, non-expired NextAuth session cookie (e.g. __Secure-next-auth.session-token). Re-run visible login to refresh cookies.'
+        )
     }
     await appendLog('INFO', `Loaded and validated cookies from ${config.cookiesFile}`)
     return parsed
