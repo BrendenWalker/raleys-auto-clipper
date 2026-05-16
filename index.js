@@ -245,8 +245,20 @@ function isNextAuthSessionCookieName(name) {
     return (
         /^__Secure-next-auth\.session-token$/i.test(name) ||
         /^__Host-next-auth\.session-token$/i.test(name) ||
-        /^next-auth\.session-token$/i.test(name)
+        /^next-auth\.session-token$/i.test(name) ||
+        /^__Secure-authjs\.session-token$/i.test(name) ||
+        /^__Host-authjs\.session-token$/i.test(name) ||
+        /^authjs\.session-token$/i.test(name)
     )
+}
+
+/** Raley's often persists storefront auth as Fieldera FLDR cookies without exporting a next-auth.* cookie name into Puppeteer's cookie list. */
+function cookieArrayHasFldrWebAuth(cookies) {
+    if (!Array.isArray(cookies)) return false
+    const active = cookies.filter((c) => c?.name && c?.value)
+    const auth = active.find((c) => c.name === 'FLDR.Auth' && String(c.value).length >= 64)
+    const session = active.find((c) => c.name === 'FLDR.Session' && String(c.value).length >= 8)
+    return Boolean(auth && session)
 }
 
 async function readNextAuthSessionPayload(page) {
@@ -357,8 +369,8 @@ function validateCookieCollection(cookies) {
         return true
     })
     if (sessionCandidates.length === 0) return false
-    // Offers API is gated on NextAuth; FLDR / analytics cookies (e.g. ai_session) are not sufficient.
-    return sessionCandidates.some((cookie) => isNextAuthSessionCookieName(cookie.name))
+    if (sessionCandidates.some((cookie) => isNextAuthSessionCookieName(cookie.name))) return true
+    return cookieArrayHasFldrWebAuth(sessionCandidates)
 }
 
 async function getLoginCookiesFromBrowser() {
@@ -596,7 +608,7 @@ async function loadCookiesFromDisk() {
     const parsed = JSON.parse(cookieFile)
     if (!validateCookieCollection(parsed)) {
         throw new Error(
-            'Cookie file exists but does not contain a valid, non-expired NextAuth session cookie (e.g. __Secure-next-auth.session-token). Re-run visible login to refresh cookies.'
+            'Cookie file exists but does not contain recognizable auth material (NextAuth session cookie or FLDR.Auth with FLDR.Session). Re-run visible login to refresh cookies.'
         )
     }
     await appendLog('INFO', `Loaded and validated cookies from ${config.cookiesFile}`)
